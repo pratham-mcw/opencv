@@ -220,13 +220,13 @@ static int sumsqr_(const T* src0, const uchar* mask, ST* sum, SQT* sqsum, int le
             SQT sq0 = sqsum[k], sq1 = sqsum[k+1], sq2 = sqsum[k+2], sq3 = sqsum[k+3];
             for(int i = x; i < len; i++, src += cn )
             {
-                T v0, v1;
+                T v0, v1, v2, v3;
                 v0 = src[0], v1 = src[1];
                 s0 += v0; sq0 += (SQT)v0*v0;
                 s1 += v1; sq1 += (SQT)v1*v1;
-                v0 = src[2], v1 = src[3];
-                s2 += v0; sq2 += (SQT)v0*v0;
-                s3 += v1; sq3 += (SQT)v1*v1;
+                v2 = src[2], v3 = src[3];
+                s2 += v2; sq2 += (SQT)v2*v2;
+                s3 += v3; sq3 += (SQT)v3*v3;
             }
             sum[k] = s0; sum[k+1] = s1;
             sum[k+2] = s2; sum[k+3] = s3;

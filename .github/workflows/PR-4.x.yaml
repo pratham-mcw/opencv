@@ -1,9 +1,10 @@
-name: PR:4.x
-
 on:
   pull_request:
     branches:
-      - 4.x
+      - main
+  push:
+    branches:
+      - fix/neon-dotprod-expand-overflow
 
 jobs:
 

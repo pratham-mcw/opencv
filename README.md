@@ -7,6 +7,8 @@
 
 
 
+
+
 * Homepage: <https://opencv.org>
   * Courses: <https://opencv.org/courses>
 * Docs: <https://docs.opencv.org/4.x/>

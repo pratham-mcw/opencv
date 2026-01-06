@@ -170,7 +170,7 @@ public:
 
     void doTest()
     {
-        #if(defined(_M_ARM64)
+        #if defined(_M_ARM64)
             return ;
          #endif   
         ASSERT_TRUE(cap.open(findDataFile(root + fileName), backend, params));

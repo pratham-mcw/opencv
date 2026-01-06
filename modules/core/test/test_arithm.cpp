@@ -1573,9 +1573,6 @@ class ElemWiseTest : public ::testing::TestWithParam<ElemWiseOpPtr> {};
 
 TEST_P(ElemWiseTest, accuracy)
 {
-    #if defined(_WIN32) && defined(_M_ARM64)
-        return ;
-    #endif
     ElemWiseOpPtr op = GetParam();
 
     int testIdx = 0;

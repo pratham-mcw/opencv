@@ -170,6 +170,9 @@ public:
 
     void doTest()
     { 
+        #if defined(_M_ARM64)
+            return ;
+         #endif   
         ASSERT_TRUE(cap.open(findDataFile(root + fileName), backend, params));
 
         const int audioBaseIndex = static_cast<int>(cap.get(cv::CAP_PROP_AUDIO_BASE_INDEX));

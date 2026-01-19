@@ -1,8 +1,6 @@
 name: 4.x
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
   workflow_dispatch:
 
 jobs:
@@ -11,4 +9,3 @@ jobs:
     with:
       target_branch: '4.x'
       workflow_branch: main
-

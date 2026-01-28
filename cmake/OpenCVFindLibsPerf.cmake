@@ -38,6 +38,20 @@ if(WITH_IPP)
   endif()
 endif()
 
+if(WITH_ARMPL)
+  include("${OpenCV_SOURCE_DIR}/cmake/OpenCVFindArmPL.cmake")
+  if(HAVE_ARMPL)
+    message(STATUS "Using ARM Performance Libraries")
+    ocv_include_directories(${ARMPL_INCLUDE_DIRS})
+    list(APPEND OPENCV_LINKER_LIBS ${ARMPL_LIBRARIES})
+    add_compile_definitions(HAVE_ARMPL)
+    
+    if(WIN32 AND NOT BUILD_SHARED_LIBS)
+      add_compile_definitions(ARMPL_STATIC)
+    endif()
+  endif()
+endif()
+
 # --- CUDA ---
 if(WITH_CUDA)
   if(ENABLE_CUDA_FIRST_CLASS_LANGUAGE)

@@ -284,6 +284,20 @@ OCV_OPTION(WITH_WAYLAND "Include Wayland support" OFF
 OCV_OPTION(WITH_IPP "Include Intel IPP support" (NOT MINGW AND NOT CV_DISABLE_OPTIMIZATION)
   VISIBLE_IF (X86_64 OR X86) AND NOT WINRT AND NOT IOS AND NOT XROS
   VERIFY HAVE_IPP)
+if((AARCH64 OR ARM64) AND WIN32 AND NOT WINRT AND NOT IOS AND NOT XROS)
+    if(NOT DEFINED WITH_ARMPL)
+        set(ARMPL_DEFAULT ON)
+    else()
+        set(ARMPL_DEFAULT ${WITH_ARMPL})
+    endif()
+else()
+    set(ARMPL_DEFAULT OFF)
+endif()
+
+OCV_OPTION(WITH_ARMPL "Include ARM Performance Libraries support (auto-download)" 
+  ${ARMPL_DEFAULT}
+  VISIBLE_IF (AARCH64 OR ARM64) AND NOT WINRT AND NOT IOS AND NOT XROS
+  VERIFY HAVE_ARMPL)
 OCV_OPTION(WITH_HALIDE "Include Halide support" OFF
   VISIBLE_IF TRUE
   VERIFY HAVE_HALIDE)
@@ -1781,6 +1795,12 @@ if(WITH_IPP AND HAVE_IPP)
   else()
     status("    Intel IPP IW:"   NO)
   endif()
+endif()
+
+if(WITH_ARMPL AND HAVE_ARMPL)
+  status("    ARM Perf Lib:" "${ARMPL_VERSION_STR}")
+  status("           at:" "${ARMPL_ROOT_DIR}")
+  status("      variant:" "${ARMPL_LIB_NAME}")
 endif()
 
 if(WITH_VA OR HAVE_VA)

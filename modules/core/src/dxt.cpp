@@ -44,6 +44,10 @@
 #include "opencv2/core/opencl/runtime/opencl_core.hpp"
 #include "opencl_kernels_core.hpp"
 #include <map>
+#if defined(HAVE_ARMPL)
+#include <armpl.h>
+#include <fftw3.h>
+#endif
 
 namespace cv
 {
@@ -66,6 +70,12 @@ namespace cv
 #else
 #define IPP_DISABLE_DFT32F false
 #endif
+#endif
+
+#if defined(HAVE_ARMPL)
+#define USE_ARMPL_DFT 1
+#else
+#undef USE_ARMPL_DFT
 #endif
 
 /****************************************************************************************\
@@ -787,6 +797,221 @@ static IppStatus ippsDFTInv_PackToR( const double* src, double* dst,
 }
 #endif
 
+#ifdef USE_ARMPL_DFT
+struct ArmplDFTSpec_C_32fc {
+    fftwf_plan plan;
+    int n;
+    bool isInverse;
+};
+
+struct ArmplDFTSpec_C_64fc {
+    fftw_plan plan;
+    int n;
+    bool isInverse;
+};
+
+struct ArmplDFTSpec_R_32f {
+    fftwf_plan plan;
+    int n;
+    bool isInverse;
+    double scale;
+};
+
+struct ArmplDFTSpec_R_64f {
+    fftw_plan plan;
+    int n;
+    bool isInverse;
+    double scale;
+};
+
+struct ArmplDFTSpec_C_32fc_WithScale {
+    fftwf_plan plan;
+    int width;
+    float scale_factor;
+};
+
+static int armplDFTFwd_CToC(const Complex<float>* src, Complex<float>* dst,
+                            const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_C_32fc* spec = static_cast<const ArmplDFTSpec_C_32fc*>(spec_);
+    if (!spec || !spec->plan) return -1;
+    
+    fftwf_execute_dft(spec->plan,
+        reinterpret_cast<fftwf_complex*>(const_cast<Complex<float>*>(src)),
+        reinterpret_cast<fftwf_complex*>(dst));
+    
+    return 0;
+}
+
+static int armplDFTInv_CToC(const Complex<float>* src, Complex<float>* dst,
+                            const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_C_32fc* spec = static_cast<const ArmplDFTSpec_C_32fc*>(spec_);
+    if (!spec || !spec->plan) return -1;
+    
+    fftwf_execute_dft(spec->plan,
+        reinterpret_cast<fftwf_complex*>(const_cast<Complex<float>*>(src)),
+        reinterpret_cast<fftwf_complex*>(dst));
+    return 0;
+}
+
+static int armplDFTFwd_CToC(const Complex<double>* src, Complex<double>* dst,
+                            const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_C_64fc* spec = static_cast<const ArmplDFTSpec_C_64fc*>(spec_);
+    if (!spec || !spec->plan) return -1;
+    
+    fftw_execute_dft(spec->plan,
+        reinterpret_cast<fftw_complex*>(const_cast<Complex<double>*>(src)),
+        reinterpret_cast<fftw_complex*>(dst));
+   
+    return 0;
+}
+
+static int armplDFTInv_CToC(const Complex<double>* src, Complex<double>* dst,
+                            const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_C_64fc* spec = static_cast<const ArmplDFTSpec_C_64fc*>(spec_);
+    if (!spec || !spec->plan) return -1;
+    
+    fftw_execute_dft(spec->plan,
+        reinterpret_cast<fftw_complex*>(const_cast<Complex<double>*>(src)),
+        reinterpret_cast<fftw_complex*>(dst));
+    
+    return 0;
+}
+
+static int armplDFTFwd_RToPack(const float* src, float* dst,
+                               const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_R_32f* spec = static_cast<const ArmplDFTSpec_R_32f*>(spec_);
+    
+    int n = spec->n;
+    
+    fftwf_complex* tmp = reinterpret_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * (n/2 + 1)));
+    
+    if (!tmp) {
+        return -1;
+    }
+    fftwf_execute_dft_r2c(spec->plan, const_cast<float*>(src), tmp);
+    dst[0] = tmp[0][0];  // DC component
+    
+    int dst_idx = 1;
+    int num_complex = (n - 1) / 2;
+    int i = 1;
+    
+#if CV_NEON
+    int simd_end = 1 + ((num_complex) / 4) * 4;
+    for(; i < simd_end; i += 4) {
+        float32x4x2_t complex_data = vld2q_f32(reinterpret_cast<const float*>(&tmp[i]));
+        vst2q_f32(&dst[dst_idx], complex_data);
+        dst_idx += 8;
+    }
+#endif  
+    for(; i <= num_complex; i++) {
+        dst[dst_idx++] = tmp[i][0];  // Real part
+        dst[dst_idx++] = tmp[i][1];  // Imaginary part
+    }
+    
+    if((n & 1) == 0) {
+        dst[n-1] = tmp[n/2][0];
+    }
+    fftwf_free(tmp);
+    return 0;
+}
+
+static int armplDFTFwd_RToPack(const double* src, double* dst,
+                               const void* spec_, uchar* /*buf*/)
+{    
+    const ArmplDFTSpec_R_64f* spec = static_cast<const ArmplDFTSpec_R_64f*>(spec_);
+    int n = spec->n;
+    fftw_complex* tmp = reinterpret_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * (n/2 + 1)));
+    
+    if (!tmp) return -1;
+    
+    fftw_execute_dft_r2c(spec->plan, const_cast<double*>(src), tmp);
+    dst[0] = tmp[0][0];  // DC component
+    
+    int dst_idx = 1;
+    int num_complex = (n - 1) / 2;
+    int i = 1;
+    
+    for(; i <= num_complex; i++) {
+        dst[dst_idx++] = tmp[i][0];  // Real part
+        dst[dst_idx++] = tmp[i][1];  // Imaginary part
+    }
+    
+    if((n & 1) == 0) {
+        dst[n-1] = tmp[n/2][0];
+    }
+    fftw_free(tmp);
+    return 0;
+}
+
+static int armplDFTInv_PackToR(const float* src, float* dst,
+                               const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_R_32f* spec = static_cast<const ArmplDFTSpec_R_32f*>(spec_);
+    
+    int n = spec->n;    
+    fftwf_complex* tmp = reinterpret_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * (n/2 + 1)));
+    
+    if (!tmp) {
+        return -1;
+    }
+    tmp[0][0] = src[0];
+    tmp[0][1] = 0.0f;
+    
+    int src_idx = 1;
+    int num_complex = (n - 1) / 2;
+    
+    for(int i = 1; i <= num_complex; i++) {
+        tmp[i][0] = src[src_idx++];  // Real part
+        tmp[i][1] = src[src_idx++];  // Imaginary part
+    }
+    
+    if((n & 1) == 0) {
+        tmp[n/2][0] = src[n-1];
+        tmp[n/2][1] = 0.0f;
+    }
+    fftwf_execute_dft_c2r(spec->plan, tmp, dst);
+    fftwf_free(tmp);
+    return 0;
+}
+
+static int armplDFTInv_PackToR(const double* src, double* dst,
+                               const void* spec_, uchar* /*buf*/)
+{
+    const ArmplDFTSpec_R_64f* spec = static_cast<const ArmplDFTSpec_R_64f*>(spec_);
+    int n = spec->n;
+    
+    fftw_complex* tmp = reinterpret_cast<fftw_complex*>(fftw_malloc(sizeof(fftw_complex) * (n/2 + 1)));
+    
+    if (!tmp) return -1;
+    
+    tmp[0][0] = src[0];
+    tmp[0][1] = 0.0;
+    
+    int src_idx = 1;
+    int num_complex = (n - 1) / 2;
+    
+    for(int i = 1; i <= num_complex; i++) {
+        tmp[i][0] = src[src_idx++];
+        tmp[i][1] = src[src_idx++];
+    }
+    
+    if((n & 1) == 0) {
+        tmp[n/2][0] = src[n-1];
+        tmp[n/2][1] = 0.0;
+    }
+    
+    fftw_execute_dft_c2r(spec->plan, tmp, dst);
+    fftw_free(tmp);
+    return 0;
+}
+
+#endif
+
 struct OcvDftOptions;
 
 typedef void (*DFTFunc)(const OcvDftOptions & c, const void* src, void* dst);
@@ -809,10 +1034,16 @@ struct OcvDftOptions {
 
     DFTFunc dft_func;
     bool useIpp;
+    bool useARMPL;
 
 #ifdef USE_IPP_DFT
     uchar* ipp_spec;
     uchar* ipp_work;
+#endif
+
+#ifdef USE_ARMPL_DFT
+    void* armpl_spec;
+    uchar* armpl_work;
 #endif
 
     OcvDftOptions()
@@ -828,9 +1059,14 @@ struct OcvDftOptions {
         noPermute = false;
         isComplex = false;
         useIpp = false;
+        useARMPL = false;
 #ifdef USE_IPP_DFT
         ipp_spec = 0;
         ipp_work = 0;
+#endif
+#ifdef USE_ARMPL_DFT
+        armpl_spec = 0;
+        armpl_work = 0;
 #endif
         dft_func = 0;
         haveSSE3 = checkHardwareSupport(CV_CPU_SSE3);
@@ -883,6 +1119,71 @@ DFT(const OcvDftOptions & c, const Complex<T>* src, Complex<T>* dst)
             }
         }
         setIppErrorStatus();
+#endif
+    }
+    if( c.useARMPL )
+    {
+#ifdef USE_ARMPL_DFT
+        if( !inv )
+        {
+            if (armplDFTFwd_CToC( src, dst, c.armpl_spec, c.armpl_work ) >= 0)
+            {
+                if (scale != 1.)
+                {
+                    const T s = (T)scale;
+
+                    int i = 0;
+                    for (; i + 3 < n; i += 4)
+                    {
+                        dst[i].re     *= s;
+                        dst[i].im     *= s;
+                        dst[i + 1].re *= s;
+                        dst[i + 1].im *= s;
+                        dst[i + 2].re *= s;
+                        dst[i + 2].im *= s;
+                        dst[i + 3].re *= s;
+                        dst[i + 3].im *= s;
+                    }
+                    for (; i < n; i++)
+                    {
+                        dst[i].re *= s;
+                        dst[i].im *= s;
+                    }
+                }
+                return;
+            }
+        }
+        else
+        {
+            if (armplDFTInv_CToC( src, dst, c.armpl_spec, c.armpl_work ) >= 0)
+            {
+                if (scale != 1.)
+                {
+                    const T s = (T)scale;
+
+                    int i = 0;
+                    for (; i + 3 < n; i += 4)
+                    {
+                        dst[i].re     = (T)(dst[i].re     * s);
+                        dst[i].im     = (T)(dst[i].im     * s);
+                        dst[i + 1].re = (T)(dst[i + 1].re * s);
+                        dst[i + 1].im = (T)(dst[i + 1].im * s);
+                        dst[i + 2].re = (T)(dst[i + 2].re * s);
+                        dst[i + 2].im = (T)(dst[i + 2].im * s);
+                        dst[i + 3].re = (T)(dst[i + 3].re * s);
+                        dst[i + 3].im = (T)(dst[i + 3].im * s);
+                    }
+
+                    // tail loop
+                    for (; i < n; i++)
+                    {
+                        dst[i].re = (T)(dst[i].re * s);
+                        dst[i].im = (T)(dst[i].im * s);
+                    }
+                }
+                return;
+            }
+        }
 #endif
     }
 
@@ -1235,6 +1536,40 @@ RealDFT(const OcvDftOptions & c, const T* src, T* dst)
         setIppErrorStatus();
 #endif
     }
+
+    if( c.useARMPL )
+    {
+#ifdef USE_ARMPL_DFT
+        if (armplDFTFwd_RToPack( src, dst, c.armpl_spec, c.armpl_work ) >= 0)
+        {
+            if (scale != 1.0)
+            {
+                const T s = (T)scale;
+                int i = 0;
+                for (; i + 3 < n; i += 4)
+                {
+                    dst[i]     *= s;
+                    dst[i + 1] *= s;
+                    dst[i + 2] *= s;
+                    dst[i + 3] *= s;
+                }
+                for (; i < n; ++i)
+                {
+                    dst[i] *= s;
+                }
+            }
+            if( complex_output )
+            {
+                dst[-1] = dst[0];
+                dst[0] = 0;
+                if( (n & 1) == 0 )
+                    dst[n] = 0;
+            }
+            return;
+        }
+#endif
+    }
+
     CV_Assert( c.tab_size == n );
 
     if( n == 1 )
@@ -1378,6 +1713,35 @@ CCSIDFT(const OcvDftOptions & c, const T* src, T* dst)
         setIppErrorStatus();
 #endif
     }
+    
+    if( c.useARMPL )
+    {
+#ifdef USE_ARMPL_DFT
+        if (armplDFTInv_PackToR(src, dst, c.armpl_spec, c.armpl_work) >= 0)
+        {
+            const T s = (T)scale;
+
+            int i = 0;
+            for (; i + 3 < n; i += 4)
+            {
+                dst[i]     *= s;
+                dst[i + 1] *= s;
+                dst[i + 2] *= s;
+                dst[i + 3] *= s;
+            }
+            for (; i < n; i++)
+            {
+                dst[i] *= s;
+            }
+
+            if (complex_input)
+                ((T*)src)[0] = (T)save_s1;
+
+            return;
+        }
+#endif
+    }
+    
     if( n == 1 )
     {
         dst[0] = (T)(src[0]*scale);
@@ -1728,7 +2092,16 @@ static void CCSIDFT_64f(const OcvDftOptions & c, const double* src, double* dst)
 typedef IppStatus (CV_STDCALL* IppDFTGetSizeFunc)(int, int, IppHintAlgorithm, int*, int*, int*);
 typedef IppStatus (CV_STDCALL* IppDFTInitFunc)(int, int, IppHintAlgorithm, void*, uchar*);
 #endif
-
+#ifdef USE_ARMPL_DFT
+    // ARMPL DFT function pointer types
+    typedef int (*ARMPLDFTGetSizeFunc)(int, int, int, int*, int*, int*);
+    typedef int (*ARMPLDFTInitFunc)(int, int, int, void*, uchar*);
+    
+    #define armplAlgHintNone 0
+    #ifndef ARMPL_DISABLE_DFT
+        #define ARMPL_DISABLE_DFT 0
+    #endif
+#endif
 namespace cv
 {
 #if defined USE_IPP_DFT
@@ -2051,6 +2424,632 @@ static bool ippi_DFT_R_32F(const uchar * src, size_t src_step, uchar * dst, size
 }
 
 #endif
+
+#if defined USE_ARMPL_DFT
+
+typedef int (*armplDFT_C_Func)(const fftwf_complex*, int, fftwf_complex*, int, const void*, uchar*);
+typedef int (*armplDFT_R_Func)(const float*, int, float*, int, const void*, uchar*);
+
+template <typename Dft>
+class Dft_C_ARMPLLoop_Invoker : public ParallelLoopBody
+{
+public:
+    Dft_C_ARMPLLoop_Invoker(const uchar * _src, size_t _src_step, uchar * _dst, size_t _dst_step, int _width,
+                            int _norm_flag, bool _inv, bool *_ok) :  // REMOVED: const Dft& parameter
+        ParallelLoopBody(),
+        src(_src), src_step(_src_step), dst(_dst), dst_step(_dst_step), width(_width),
+        norm_flag(_norm_flag), inv(_inv), ok(_ok)
+    {
+        *ok = true;
+    }
+
+    virtual void operator()(const Range& range) const CV_OVERRIDE
+    {        
+        int sign = inv ? FFTW_BACKWARD : FFTW_FORWARD;    
+        fftwf_complex* fftw_in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * width);
+        fftwf_complex* fftw_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * width);
+        
+        if (!fftw_in || !fftw_out)
+        {
+            if (fftw_in) fftwf_free(fftw_in);
+            if (fftw_out) fftwf_free(fftw_out);
+            *ok = false;
+            return;
+        }
+        fftwf_plan plan = fftwf_plan_dft_1d(width, fftw_in, fftw_out, sign, FFTW_ESTIMATE);
+        
+        if (!plan)
+        {
+            fftwf_free(fftw_in);
+            fftwf_free(fftw_out);
+            *ok = false;
+            return;
+        }
+
+        float scale_factor = 1.0f;
+
+        if (inv)
+        {
+            if (norm_flag == 8)
+            {
+                scale_factor = 1.0f;
+            }
+            else if (norm_flag == 1 || norm_flag == 2)
+            {
+                scale_factor = 1.0f / width;
+            }
+        }
+        else
+        {
+            if (norm_flag == 1)
+            {
+                scale_factor = 1.0f / width;
+            }
+            else
+            {
+                scale_factor = 1.0f;
+            }
+        }
+        for(int i = range.start; i < range.end; ++i)
+        {
+            const Complex<float>* src_row = (const Complex<float>*)(src + src_step * i);
+            Complex<float>* dst_row = (Complex<float>*)(dst + dst_step * i);
+            
+            int j = 0;
+            for (; j + 3 < width; j += 4)
+            {
+                fftw_in[j][0]     = src_row[j].re;
+                fftw_in[j][1]     = src_row[j].im;
+
+                fftw_in[j + 1][0] = src_row[j + 1].re;
+                fftw_in[j + 1][1] = src_row[j + 1].im;
+
+                fftw_in[j + 2][0] = src_row[j + 2].re;
+                fftw_in[j + 2][1] = src_row[j + 2].im;
+
+                fftw_in[j + 3][0] = src_row[j + 3].re;
+                fftw_in[j + 3][1] = src_row[j + 3].im;
+            }
+
+            for (; j < width; j++)
+            {
+                fftw_in[j][0] = src_row[j].re;
+                fftw_in[j][1] = src_row[j].im;
+            }
+            fftwf_execute(plan);
+            j = 0;
+            for (; j + 3 < width; j += 4)
+            {
+                dst_row[j].re     = fftw_out[j][0]     * scale_factor;
+                dst_row[j].im     = fftw_out[j][1]     * scale_factor;
+
+                dst_row[j + 1].re = fftw_out[j + 1][0] * scale_factor;
+                dst_row[j + 1].im = fftw_out[j + 1][1] * scale_factor;
+
+                dst_row[j + 2].re = fftw_out[j + 2][0] * scale_factor;
+                dst_row[j + 2].im = fftw_out[j + 2][1] * scale_factor;
+
+                dst_row[j + 3].re = fftw_out[j + 3][0] * scale_factor;
+                dst_row[j + 3].im = fftw_out[j + 3][1] * scale_factor;
+            }
+
+            for (; j < width; j++)
+            {
+                dst_row[j].re = fftw_out[j][0] * scale_factor;
+                dst_row[j].im = fftw_out[j][1] * scale_factor;
+            }
+        }
+
+        fftwf_destroy_plan(plan);
+        fftwf_free(fftw_in);
+        fftwf_free(fftw_out);
+    }
+
+private:
+    const uchar * src;
+    size_t src_step;
+    uchar * dst;
+    size_t dst_step;
+    int width;
+    int norm_flag;
+    bool inv;
+    bool *ok;
+
+    const Dft_C_ARMPLLoop_Invoker& operator= (const Dft_C_ARMPLLoop_Invoker&);
+};
+
+template <typename Dft>
+class Dft_R_ARMPLLoop_Invoker : public ParallelLoopBody
+{
+public:
+    Dft_R_ARMPLLoop_Invoker(const uchar * _src, size_t _src_step, uchar * _dst, size_t _dst_step, int _width,
+                            const Dft& _armpldft, int _norm_flag, bool *_ok) :
+        ParallelLoopBody(),
+        src(_src), src_step(_src_step), dst(_dst), dst_step(_dst_step), width(_width),
+        armpldft(_armpldft), norm_flag(_norm_flag), ok(_ok)
+    {
+        *ok = true;
+    }
+
+    virtual void operator()(const Range& range) const CV_OVERRIDE
+    {
+        ArmplDFTSpec_R_32f* pDFTSpec = new ArmplDFTSpec_R_32f;
+        pDFTSpec->n = width;
+        
+        float* tmp_in_r = (float*)fftwf_malloc(sizeof(float) * width);
+        fftwf_complex* tmp_out_c = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (width/2 + 1));
+        
+        if (norm_flag & DFT_INVERSE)
+            pDFTSpec->plan = fftwf_plan_dft_c2r_1d(width, tmp_out_c, tmp_in_r, FFTW_ESTIMATE);
+        else
+            pDFTSpec->plan = fftwf_plan_dft_r2c_1d(width, tmp_in_r, tmp_out_c, FFTW_ESTIMATE);
+        
+        fftwf_free(tmp_in_r);
+        fftwf_free(tmp_out_c);
+        
+        if (!pDFTSpec->plan)
+        {
+            delete pDFTSpec;
+            *ok = false;
+            return;
+        }
+
+        for(int i = range.start; i < range.end; ++i)
+        {
+            if(!armpldft((float*)(src + src_step * i), src_step, 
+                        (float*)(dst + dst_step * i), dst_step,
+                        pDFTSpec, nullptr))
+            {
+                *ok = false;
+            }
+        }
+
+        fftwf_destroy_plan(pDFTSpec->plan);
+        delete pDFTSpec;
+    }
+
+private:
+    const uchar * src;
+    size_t src_step;
+    uchar * dst;
+    size_t dst_step;
+    int width;
+    const Dft& armpldft;
+    int norm_flag;
+    bool *ok;
+
+    const Dft_R_ARMPLLoop_Invoker& operator= (const Dft_R_ARMPLLoop_Invoker&);
+};
+
+static bool armpl_DFT_C_32F(const uchar * src, size_t src_step, uchar * dst, size_t dst_step, 
+                            int width, int height, bool inv, int norm_flag)
+{
+    fftwf_complex* in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * width * height);
+    fftwf_complex* out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * width * height);
+    
+    if (!in || !out)
+    {
+        if (in) fftwf_free(in);
+        if (out) fftwf_free(out);
+        return false;
+    }
+    for (int y = 0; y < height; y++)
+    {
+        const Complex<float>* src_row = (const Complex<float>*)(src + y * src_step);
+        int base = y * width;
+        int x = 0;
+
+#if CV_NEON
+        for (; x + 3 < width; x += 4)
+        {
+            float32x4_t data0 = vld1q_f32((const float*)&src_row[x]);      
+            float32x4_t data1 = vld1q_f32((const float*)&src_row[x + 2]);  
+            vst1q_f32((float*)&in[base + x], data0);
+            vst1q_f32((float*)&in[base + x + 2], data1);
+        }
+#endif
+        for (; x < width; x++)
+        {
+            in[base + x][0] = src_row[x].re;
+            in[base + x][1] = src_row[x].im;
+        }
+    }
+
+    int sign = inv ? FFTW_BACKWARD : FFTW_FORWARD;
+    fftwf_plan plan = fftwf_plan_dft_2d(height, width, in, out, sign, FFTW_ESTIMATE);
+    
+    if (!plan)
+    {
+        fftwf_free(in);
+        fftwf_free(out);
+        return false;
+    }
+    
+    fftwf_execute(plan);
+    
+    float scale = 1.0f;
+    int total_size = width * height;
+    
+    if (norm_flag == 1)
+    {
+        scale = inv ? 1.0f : (1.0f / total_size);
+    }
+    else if (norm_flag == 2)
+    {
+        scale = inv ? (1.0f / total_size) : 1.0f;
+    }
+    else if (norm_flag == 8)
+    {
+        scale = 1.0f;
+    }
+
+#if CV_NEON
+    const float32x4_t scale_vec = vdupq_n_f32(scale);
+#endif
+
+    for (int y = 0; y < height; y++)
+    {
+        Complex<float>* dst_row = (Complex<float>*)(dst + y * dst_step);
+        int base = y * width;
+        int x = 0;
+
+#if CV_NEON
+        for (; x + 3 < width; x += 4)
+        {
+            float32x4_t data0 = vld1q_f32((const float*)&out[base + x]);    
+            float32x4_t data1 = vld1q_f32((const float*)&out[base + x + 2]);
+            data0 = vmulq_f32(data0, scale_vec);
+            data1 = vmulq_f32(data1, scale_vec);
+            vst1q_f32(&dst_row[x].re, data0);
+            vst1q_f32(&dst_row[x + 2].re, data1);
+        }
+#endif
+
+        for (; x < width; x++)
+        {
+            dst_row[x].re = out[base + x][0] * scale;
+            dst_row[x].im = out[base + x][1] * scale;
+        }
+    }
+
+    fftwf_destroy_plan(plan);
+    fftwf_free(in);
+    fftwf_free(out);
+    
+    return true;
+}
+
+static bool armpl_DFT_R_32F(const uchar * src, size_t src_step, uchar * dst, size_t dst_step, 
+                            int width, int height, bool inv, int norm_flag)
+{
+    if (!inv)
+    {
+        if (width == 1)
+        {            
+            float* in = (float*)fftwf_malloc(sizeof(float) * height);
+            fftwf_complex* out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (height/2 + 1));
+            
+            if (!in || !out)
+            {
+                if (in) fftwf_free(in);
+                if (out) fftwf_free(out);
+                return false;
+            }
+            
+            for (int y = 0; y < height; y++)
+            {
+                const float* src_row = (const float*)(src + y * src_step);
+                in[y] = src_row[0];
+            }
+            
+            fftwf_plan plan = fftwf_plan_dft_r2c_1d(height, in, out, FFTW_ESTIMATE);
+            if (!plan)
+            {
+                fftwf_free(in);
+                fftwf_free(out);
+                return false;
+            }
+            
+            fftwf_execute(plan);
+            
+            float scale = 1.0f;
+            if (norm_flag == 1)
+                scale = 1.0f / height;
+            
+            float* dst_ptr = (float*)dst;
+            dst_ptr[0] = out[0][0] * scale;
+            
+            int num_complex_pairs = (height - 1) / 2;
+            
+            for (int k = 1; k <= num_complex_pairs; k++)
+            {
+                float* dst_row_real = (float*)(dst + (2*k - 1) * dst_step);
+                dst_row_real[0] = out[k][0] * scale;
+                
+                float* dst_row_imag = (float*)(dst + (2*k) * dst_step);
+                dst_row_imag[0] = out[k][1] * scale;
+            }
+            
+            if ((height & 1) == 0)
+            {
+                float* dst_nyquist = (float*)(dst + (height - 1) * dst_step);
+                dst_nyquist[0] = out[height/2][0] * scale;
+            }
+            
+            fftwf_destroy_plan(plan);
+            fftwf_free(in);
+            fftwf_free(out);
+            return true;
+        }
+                
+        // 2D case
+        float* in = (float*)fftwf_malloc(sizeof(float) * width * height);
+        fftwf_complex* out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * height * (width/2 + 1));
+        
+        if (!in || !out)
+        {
+            if (in) fftwf_free(in);
+            if (out) fftwf_free(out);
+            return false;
+        }
+        
+        for (int y = 0; y < height; y++)
+        {
+            const float* src_row = (const float*)(src + y * src_step);
+            for (int x = 0; x < width; x++)
+            {
+                in[y * width + x] = src_row[x];
+            }
+        }
+        
+        fftwf_plan plan = fftwf_plan_dft_r2c_2d(height, width, in, out, FFTW_ESTIMATE);
+        if (!plan)
+        {
+            fftwf_free(in);
+            fftwf_free(out);
+            return false;
+        }
+        
+        fftwf_execute(plan);
+        
+        float scale = 1.0f;
+        if (norm_flag == 1)
+            scale = 1.0f / (width * height);
+
+        for (int y = 0; y < height; y++)
+        {
+            float* dst_row = (float*)(dst + y * dst_step);
+            int fftw_idx = y * (width/2 + 1);
+            
+            if (y == 0 || y == 1)
+            {
+                dst_row[0] = out[fftw_idx][0] * scale;
+            }
+            else if ((y & 1) == 0)
+            {
+                int src_fftw_idx = (y / 2) * (width/2 + 1);
+                dst_row[0] = out[src_fftw_idx][1] * scale;
+            }
+            else
+            {
+                int src_fftw_idx = ((y + 1) / 2) * (width/2 + 1);
+                dst_row[0] = out[src_fftw_idx][0] * scale;
+            }
+            
+            int num_complex_pairs = (width - 1) / 2;
+            for (int k = 1; k <= num_complex_pairs; k++)
+            {
+                dst_row[2*k - 1] = out[fftw_idx + k][0] * scale;
+                dst_row[2*k]     = out[fftw_idx + k][1] * scale;
+            }
+            
+            if ((width & 1) == 0)
+            {
+                if (y == 0 || y == 1)
+                {
+                    dst_row[width - 1] = out[fftw_idx + width/2][0] * scale;
+                }
+                else if ((y & 1) == 0)
+                {
+                    int src_fftw_idx = (y / 2) * (width/2 + 1);
+                    dst_row[width - 1] = out[src_fftw_idx + width/2][1] * scale;
+                }
+                else
+                {
+                    int src_fftw_idx = ((y + 1) / 2) * (width/2 + 1);
+                    dst_row[width - 1] = out[src_fftw_idx + width/2][0] * scale;
+                }
+            }
+        }
+        
+        fftwf_destroy_plan(plan);
+        fftwf_free(in);
+        fftwf_free(out);
+        return true;
+    }    
+    return false;
+}
+
+static bool armpl_DFT_R_RowWise(const uchar * src, size_t src_step, uchar * dst, size_t dst_step, 
+                                int width, int height, int norm_flag, bool inv)
+{
+    if (!inv)
+    {
+        float* fftw_in = (float*)fftwf_malloc(sizeof(float) * width);
+        fftwf_complex* fftw_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (width/2 + 1));
+        
+        if (!fftw_in || !fftw_out)
+        {
+            if (fftw_in) fftwf_free(fftw_in);
+            if (fftw_out) fftwf_free(fftw_out);
+            return false;
+        }
+        
+        fftwf_plan plan = fftwf_plan_dft_r2c_1d(width, fftw_in, fftw_out, FFTW_ESTIMATE);
+        if (!plan)
+        {
+            fftwf_free(fftw_in);
+            fftwf_free(fftw_out);
+            return false;
+        }
+        
+        float scale_factor = 1.0f;
+        if (norm_flag == 1)
+            scale_factor = 1.0f / width;
+        
+        for (int i = 0; i < height; i++)
+        {
+            const float* src_row = (const float*)(src + src_step * i);
+            float* dst_row = (float*)(dst + dst_step * i);
+            
+            memcpy(fftw_in, src_row, width * sizeof(float));
+            fftwf_execute(plan);
+            
+            dst_row[0] = fftw_out[0][0] * scale_factor;
+            
+            int num_complex_freq = (width - 1) / 2;
+            for (int j = 1; j <= num_complex_freq; j++)
+            {
+                dst_row[j*2-1] = fftw_out[j][0] * scale_factor;
+                dst_row[j*2] = fftw_out[j][1] * scale_factor;
+            }
+            
+            if ((width & 1) == 0)
+                dst_row[width-1] = fftw_out[width/2][0] * scale_factor;
+        }
+        
+        fftwf_destroy_plan(plan);
+        fftwf_free(fftw_in);
+        fftwf_free(fftw_out);
+        return true;
+    }
+    else
+    {
+        fftwf_complex* fftw_in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (width/2 + 1));
+        float* fftw_out = (float*)fftwf_malloc(sizeof(float) * width);
+        
+        if (!fftw_in || !fftw_out)
+        {
+            if (fftw_in) fftwf_free(fftw_in);
+            if (fftw_out) fftwf_free(fftw_out);
+            return false;
+        }
+        
+        fftwf_plan plan = fftwf_plan_dft_c2r_1d(width, fftw_in, fftw_out, FFTW_ESTIMATE);
+        if (!plan)
+        {
+            fftwf_free(fftw_in);
+            fftwf_free(fftw_out);
+            return false;
+        }
+        
+        float scale_factor;
+        if (norm_flag == 8)
+            scale_factor = 1.0f;
+        else
+            scale_factor = 1.0f / width;
+        
+        for (int i = 0; i < height; i++)
+        {
+            const float* src_row = (const float*)(src + src_step * i);
+            float* dst_row = (float*)(dst + dst_step * i);
+            
+            fftw_in[0][0] = src_row[0];
+            fftw_in[0][1] = 0;
+            
+            // int num_complex_freq = (width - 1) / 2;
+            bool has_nyquist = (width & 1) == 0;
+            
+            if (has_nyquist)
+            {
+                int j = 1;
+                int end = width / 2;
+
+                for (; j + 3 < end; j += 4)
+                {
+                    fftw_in[j][0]     = src_row[j * 2 - 1];
+                    fftw_in[j][1]     = src_row[j * 2];
+
+                    fftw_in[j + 1][0] = src_row[(j + 1) * 2 - 1];
+                    fftw_in[j + 1][1] = src_row[(j + 1) * 2];
+
+                    fftw_in[j + 2][0] = src_row[(j + 2) * 2 - 1];
+                    fftw_in[j + 2][1] = src_row[(j + 2) * 2];
+
+                    fftw_in[j + 3][0] = src_row[(j + 3) * 2 - 1];
+                    fftw_in[j + 3][1] = src_row[(j + 3) * 2];
+                }
+
+                for (; j < end; j++)
+                {
+                    fftw_in[j][0] = src_row[j * 2 - 1];
+                    fftw_in[j][1] = src_row[j * 2];
+                }
+
+                // Nyquist term
+                fftw_in[width / 2][0] = src_row[width - 1];
+                fftw_in[width / 2][1] = 0;
+            }
+
+            else
+            {
+                int j = 1;
+                int end = width / 2 + 1;
+
+                for (; j + 3 < end; j += 4)
+                {
+                    fftw_in[j][0]     = src_row[j * 2 - 1];
+                    fftw_in[j][1]     = src_row[j * 2];
+
+                    fftw_in[j + 1][0] = src_row[(j + 1) * 2 - 1];
+                    fftw_in[j + 1][1] = src_row[(j + 1) * 2];
+
+                    fftw_in[j + 2][0] = src_row[(j + 2) * 2 - 1];
+                    fftw_in[j + 2][1] = src_row[(j + 2) * 2];
+
+                    fftw_in[j + 3][0] = src_row[(j + 3) * 2 - 1];
+                    fftw_in[j + 3][1] = src_row[(j + 3) * 2];
+                }
+
+                for (; j < end; j++)
+                {
+                    fftw_in[j][0] = src_row[j * 2 - 1];
+                    fftw_in[j][1] = src_row[j * 2];
+                }
+            }
+
+            fftwf_execute(plan);
+            
+            int j = 0;
+            for (; j + 3 < width; j += 4) {
+                dst_row[j]     = fftw_out[j]     * scale_factor;
+                dst_row[j + 1] = fftw_out[j + 1] * scale_factor;
+                dst_row[j + 2] = fftw_out[j + 2] * scale_factor;
+                dst_row[j + 3] = fftw_out[j + 3] * scale_factor;
+            }
+            for (; j < width; j++) {
+                dst_row[j] = fftw_out[j] * scale_factor;
+            }
+        }
+        
+        fftwf_destroy_plan(plan);
+        fftwf_free(fftw_in);
+        fftwf_free(fftw_out);
+        return true;
+    }
+}
+
+bool Dft_C_ARMPLLoop_Direct(const uchar * src, size_t src_step, uchar * dst, size_t dst_step, 
+                            int width, int height, int norm_flag, bool inv)
+{
+    bool ok;
+    parallel_for_(Range(0, height), 
+                  Dft_C_ARMPLLoop_Invoker<void>(src, src_step, dst, dst_step, width, norm_flag, inv, &ok), 
+                  (width * height)/(double)(1<<16));
+    return ok;
+}
+
+#endif // USE_ARMPL_DFT
 }
 
 #ifdef HAVE_OPENCL
@@ -2817,6 +3816,7 @@ protected:
     bool isScaled;
     std::vector<int> stages;
     bool useIpp;
+    bool useARMPL;
     int src_channels;
     int dst_channels;
 
@@ -2842,6 +3842,7 @@ public:
         isRowTransform = false;
         isScaled = false;
         useIpp = false;
+        useARMPL = false;
         src_channels = 0;
         dst_channels = 0;
     }
@@ -2881,6 +3882,16 @@ public:
                     useIpp = true;
                     return;
                 }
+            }
+        }
+#endif
+
+#if defined USE_ARMPL_DFT
+        if (nonzero_rows == 0 && depth == CV_32F && ((width * height)>(int)(1<<6)))
+        {
+            if (mode == FwdComplexToComplex || mode == InvComplexToComplex || mode == FwdRealToCCS || mode == InvCCSToReal)
+            {
+                useARMPL = true;
             }
         }
 #endif
@@ -3020,6 +4031,47 @@ public:
                 }
             }
             return;
+        }
+#endif
+
+#if defined USE_ARMPL_DFT
+        if (useARMPL)
+        {
+            int armpl_norm_flag = !isScaled ? 8 : inv ? 2 : 1;          
+            if (!isRowTransform)
+            {
+                if (mode == FwdComplexToComplex || mode == InvComplexToComplex)
+                {
+                    if (armpl_DFT_C_32F(src, src_step, dst, dst_step, width, height, inv, armpl_norm_flag))
+                    {
+                        return;
+                    }
+                }
+                else if (mode == FwdRealToCCS || mode == InvCCSToReal)
+                {
+                    if (armpl_DFT_R_32F(src, src_step, dst, dst_step, width, height, inv, armpl_norm_flag))
+                    {
+                        return;
+                    }
+                }
+            }
+            else
+            {
+                if (mode == FwdComplexToComplex || mode == InvComplexToComplex)
+                {
+                    if (Dft_C_ARMPLLoop_Direct(src, src_step, dst, dst_step, width, height, armpl_norm_flag, inv))
+                    {
+                        return;
+                    }
+                }
+                else if (mode == FwdRealToCCS || mode == InvCCSToReal)
+                {
+                    if (armpl_DFT_R_RowWise(src, src_step, dst, dst_step, width, height, armpl_norm_flag, inv))
+                    {
+                        return;
+                    }
+                }
+            }
         }
 #endif
 
@@ -3240,6 +4292,10 @@ public:
     AutoBuffer<uchar> ippbuf;
     AutoBuffer<uchar> ippworkbuf;
 #endif
+#ifdef USE_ARMPL_DFT
+    AutoBuffer<uchar> armplbuf;
+    AutoBuffer<uchar> armplworkbuf;
+#endif
 
 public:
     OcvDftBasicImpl()
@@ -3262,6 +4318,8 @@ public:
         opt.n = len;
 
         opt.useIpp = false;
+        opt.useARMPL = false;
+        
     #ifdef USE_IPP_DFT
         opt.ipp_spec = 0;
         opt.ipp_work = 0;
@@ -3314,7 +4372,155 @@ public:
         }
     #endif
 
-        if (!opt.useIpp)
+#ifdef USE_ARMPL_DFT
+        opt.armpl_spec = 0;
+        opt.armpl_work = 0;
+
+        if (!opt.useIpp && (opt.n*count >= 64))
+        {           
+            bool armpl_init_success = false;
+            bool needAnotherStage = (flags & CV_HAL_DFT_TWO_STAGE) != 0;
+            bool has_scale_flag = (flags & CV_HAL_DFT_SCALE) != 0;
+            
+            double armpl_scale = 1.0;
+            if(!needAnotherStage && has_scale_flag)
+            {
+                int rowCount = count;
+                if (stage == 0 && (flags & CV_HAL_DFT_ROWS) != 0)
+                    rowCount = 1;
+                armpl_scale = 1.0 / (len * rowCount);
+            }
+            if (real_transform && stage == 0)
+            {
+                if (depth == CV_32F)
+                {
+                    armplbuf.allocate(sizeof(ArmplDFTSpec_R_32f) + 64);
+                    opt.armpl_spec = alignPtr(&armplbuf[0], 32);
+                    ArmplDFTSpec_R_32f* spec = (ArmplDFTSpec_R_32f*)opt.armpl_spec;
+                    
+                    memset(spec, 0, sizeof(ArmplDFTSpec_R_32f));
+                    
+                    float* dummy_in = (float*)fftwf_malloc(sizeof(float) * opt.n);
+                    fftwf_complex* dummy_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * (opt.n/2 + 1));
+                    
+                    if (dummy_in && dummy_out)
+                    {
+                        if (!opt.isInverse) {
+                            spec->plan = fftwf_plan_dft_r2c_1d(opt.n, dummy_in, dummy_out, FFTW_ESTIMATE);
+                        } else {
+                            spec->plan = fftwf_plan_dft_c2r_1d(opt.n, dummy_out, dummy_in, FFTW_ESTIMATE);
+                        }
+                        spec->n = opt.n;
+                        spec->isInverse = opt.isInverse;
+                        spec->scale = armpl_scale;
+                        if (spec->plan)
+                        {
+                            armpl_init_success = true;
+                            opt.useARMPL = true;
+                        }
+                    }
+                    
+                    if (dummy_in) fftwf_free(dummy_in);
+                    if (dummy_out) fftwf_free(dummy_out);
+                }
+                else  // CV_64F
+                {
+                    armplbuf.allocate(sizeof(ArmplDFTSpec_R_64f) + 64);
+                    opt.armpl_spec = alignPtr(&armplbuf[0], 32);
+                    ArmplDFTSpec_R_64f* spec = (ArmplDFTSpec_R_64f*)opt.armpl_spec;
+                    
+                    memset(spec, 0, sizeof(ArmplDFTSpec_R_64f));
+                    
+                    double* dummy_in = (double*)fftw_malloc(sizeof(double) * opt.n);
+                    fftw_complex* dummy_out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (opt.n/2 + 1));
+                    
+                    if (dummy_in && dummy_out)
+                    {
+                        if (!opt.isInverse) {
+                            spec->plan = fftw_plan_dft_r2c_1d(opt.n, dummy_in, dummy_out, FFTW_ESTIMATE);
+                        } else {
+                            spec->plan = fftw_plan_dft_c2r_1d(opt.n, dummy_out, dummy_in, FFTW_ESTIMATE);
+                        }
+                        spec->n = opt.n;
+                        spec->isInverse = opt.isInverse;
+                        spec->scale = armpl_scale;
+                        if (spec->plan)
+                        {
+                            armpl_init_success = true;
+                            opt.useARMPL = true;
+                        }
+                    }
+                    if (dummy_in) fftw_free(dummy_in);
+                    if (dummy_out) fftw_free(dummy_out);
+                }
+            }
+            else  // Complex transforms
+            {
+                if (depth == CV_32F)
+                {
+                    armplbuf.allocate(sizeof(ArmplDFTSpec_C_32fc) + 64);
+                    opt.armpl_spec = alignPtr(&armplbuf[0], 32);
+                    ArmplDFTSpec_C_32fc* spec = (ArmplDFTSpec_C_32fc*)opt.armpl_spec;
+                    
+                    memset(spec, 0, sizeof(ArmplDFTSpec_C_32fc));
+                    
+                    fftwf_complex* dummy_in = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * opt.n);
+                    fftwf_complex* dummy_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * opt.n);
+                    
+                    if (dummy_in && dummy_out)
+                    {
+                        int sign = opt.isInverse ? FFTW_BACKWARD : FFTW_FORWARD;
+                        spec->plan = fftwf_plan_dft_1d(opt.n, dummy_in, dummy_out, sign, FFTW_ESTIMATE);
+                        spec->n = opt.n;
+                        spec->isInverse = opt.isInverse;
+                        if (spec->plan)
+                        {
+                            armpl_init_success = true;
+                            opt.useARMPL = true;
+                        }
+                    }
+                    
+                    if (dummy_in) fftwf_free(dummy_in);
+                    if (dummy_out) fftwf_free(dummy_out);
+                }
+                else  // CV_64F
+                {
+                    armplbuf.allocate(sizeof(ArmplDFTSpec_C_64fc) + 64);
+                    opt.armpl_spec = alignPtr(&armplbuf[0], 32);
+                    ArmplDFTSpec_C_64fc* spec = (ArmplDFTSpec_C_64fc*)opt.armpl_spec;
+                    
+                    memset(spec, 0, sizeof(ArmplDFTSpec_C_64fc));
+                    
+                    fftw_complex* dummy_in = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * opt.n);
+                    fftw_complex* dummy_out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * opt.n);
+                    
+                    if (dummy_in && dummy_out)
+                    {
+                        int sign = opt.isInverse ? FFTW_BACKWARD : FFTW_FORWARD;
+                        spec->plan = fftw_plan_dft_1d(opt.n, dummy_in, dummy_out, sign, FFTW_ESTIMATE);
+                        spec->n = opt.n;
+                        spec->isInverse = opt.isInverse;
+                        
+                        if (spec->plan)
+                        {
+                            armpl_init_success = true;
+                            opt.useARMPL = true;
+                        }
+                    }
+                    
+                    if (dummy_in) fftw_free(dummy_in);
+                    if (dummy_out) fftw_free(dummy_out);
+                }
+            }
+            
+            if (armpl_init_success)
+            {
+                armplworkbuf.allocate(64);
+                opt.armpl_work = alignPtr(&armplworkbuf[0], 32);
+            }            
+        }
+#endif
+        if (!opt.useIpp && !opt.useARMPL)
         {
             if (len != prev_len)
             {

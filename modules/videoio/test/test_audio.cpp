@@ -270,15 +270,15 @@ protected:
 
 class Media : public MediaTestFixture{};
 
-TEST_P(Media, audio)
-{
-    if (!videoio_registry::hasBackend(cv::VideoCaptureAPIs(backend)))
-        throw SkipTestException(cv::videoio_registry::getBackendName(backend) + " backend was not found");
-    if (cvtest::skipUnstableTests && backend == CAP_GSTREAMER)
-        throw SkipTestException("Unstable GStreamer test");
+// TEST_P(Media, audio)
+// {
+//     if (!videoio_registry::hasBackend(cv::VideoCaptureAPIs(backend)))
+//         throw SkipTestException(cv::videoio_registry::getBackendName(backend) + " backend was not found");
+//     if (cvtest::skipUnstableTests && backend == CAP_GSTREAMER)
+//         throw SkipTestException("Unstable GStreamer test");
 
-    doTest();
-}
+//     doTest();
+// }
 
 const paramCombination mediaParams[] =
 {

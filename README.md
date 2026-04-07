@@ -11,6 +11,7 @@
 * Additional OpenCV functionality: <https://github.com/opencv/opencv_contrib>
 * Donate to OpenCV: <https://opencv.org/support/>
 
+
 ### Contributing
 
 Please read the [contribution guidelines](https://github.com/opencv/opencv/wiki/How_to_contribute) before starting work on a pull request.

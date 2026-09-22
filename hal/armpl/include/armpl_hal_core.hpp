@@ -86,6 +86,14 @@ int armpl_hal_dctFree2D(cvhalDFT *context);
 #undef  cv_hal_dctFree2D
 #define cv_hal_dctFree2D armpl_hal_dctFree2D
 
+int armpl_hal_LU32f(float* a, size_t a_step, int m, float* b, size_t b_step, int n, int* info);
+int armpl_hal_LU64f(double* a, size_t a_step, int m, double* b, size_t b_step, int n, int* info);
+
+#undef  cv_hal_LU32f
+#define cv_hal_LU32f armpl_hal_LU32f
+#undef  cv_hal_LU64f
+#define cv_hal_LU64f armpl_hal_LU64f
+
 #endif  // HAVE_ARMPL
 
 #endif  // OPENCV_ARMPL_HAL_CORE_HPP

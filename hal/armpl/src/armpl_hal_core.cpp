@@ -3,322 +3,13 @@
 #include "armpl_hal_core.hpp"
 
 #include <fftw3.h>
-#include <cblas.h>
-#include <lapacke.h>
-#include <algorithm>
-#include <complex>
-#include <vector>
+#include <armpl.h>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
-
-#define ARMPL_GEMM_MIN_WORK_VOLUME 10000
-#define ARMPL_SVD_SMALL_MATRIX_THRESH 33
-#define ARMPL_LU_SMALL_MATRIX_THRESH 100
-
-namespace {
-
-template <typename fptype> static inline void
-armpl_transpose(const fptype *src, size_t src_ld, fptype *dst, size_t dst_ld, size_t m, size_t n)
-{
-    for (size_t i = 0; i < m; i++)
-        for (size_t j = 0; j < n; j++)
-            dst[j*dst_ld + i] = src[i*src_ld + j];
-}
-
-template <typename fptype> static inline void
-armpl_copy_matrix(const fptype *src, size_t src_ld, fptype *dst, size_t dst_ld, size_t m, size_t n)
-{
-    for (size_t i = 0; i < m; i++)
-        std::copy(src + i*src_ld, src + i*src_ld + n, dst + i*dst_ld);
-}
-
-template <typename fptype> static inline void
-armpl_set_value(fptype *dst, size_t dst_ld, fptype value, size_t m, size_t n)
-{
-    for (size_t i = 0; i < m; i++)
-        std::fill(dst + i*dst_ld, dst + i*dst_ld + n, value);
-}
-
-static inline void
-armpl_cblas_gemm(CBLAS_TRANSPOSE transA, CBLAS_TRANSPOSE transB, int a_m, int d_n, int a_n,
-                  float alpha, const float *src1, int ldsrc1, const float *src2, int ldsrc2,
-                  float beta, float *dst, int lddst)
-{
-    cblas_sgemm(CblasRowMajor, transA, transB, a_m, d_n, a_n, alpha, src1, ldsrc1, src2, ldsrc2, beta, dst, lddst);
-}
-
-static inline void
-armpl_cblas_gemm(CBLAS_TRANSPOSE transA, CBLAS_TRANSPOSE transB, int a_m, int d_n, int a_n,
-                  double alpha, const double *src1, int ldsrc1, const double *src2, int ldsrc2,
-                  double beta, double *dst, int lddst)
-{
-    cblas_dgemm(CblasRowMajor, transA, transB, a_m, d_n, a_n, alpha, src1, ldsrc1, src2, ldsrc2, beta, dst, lddst);
-}
-
-static inline void
-armpl_cblas_gemm(CBLAS_TRANSPOSE transA, CBLAS_TRANSPOSE transB, int a_m, int d_n, int a_n,
-                  std::complex<float> alpha, const std::complex<float> *src1, int ldsrc1,
-                  const std::complex<float> *src2, int ldsrc2,
-                  std::complex<float> beta, std::complex<float> *dst, int lddst)
-{
-    cblas_cgemm(CblasRowMajor, transA, transB, a_m, d_n, a_n, &alpha, src1, ldsrc1, src2, ldsrc2, &beta, dst, lddst);
-}
-
-static inline void
-armpl_cblas_gemm(CBLAS_TRANSPOSE transA, CBLAS_TRANSPOSE transB, int a_m, int d_n, int a_n,
-                  std::complex<double> alpha, const std::complex<double> *src1, int ldsrc1,
-                  const std::complex<double> *src2, int ldsrc2,
-                  std::complex<double> beta, std::complex<double> *dst, int lddst)
-{
-    cblas_zgemm(CblasRowMajor, transA, transB, a_m, d_n, a_n, &alpha, src1, ldsrc1, src2, ldsrc2, &beta, dst, lddst);
-}
-
-template <typename elemtype, typename scalartype> static inline int
-armpl_gemm_impl(const elemtype *src1, size_t src1_step, const elemtype *src2, size_t src2_step, scalartype alpha,
-                const elemtype *src3, size_t src3_step, scalartype beta, elemtype *dst, size_t dst_step,
-                int a_m, int a_n, int d_n, int flags)
-{
-    int ldsrc1 = (int)(src1_step / sizeof(elemtype));
-    int ldsrc2 = (int)(src2_step / sizeof(elemtype));
-    int ldsrc3 = (int)(src3_step / sizeof(elemtype));
-    int lddst  = (int)(dst_step  / sizeof(elemtype));
-    int c_m, c_n, d_m;
-    CBLAS_TRANSPOSE transA, transB;
-    elemtype eAlpha = (elemtype)alpha;
-    elemtype eBeta  = (elemtype)beta;
-
-    transB = (flags & CV_HAL_GEMM_2_T) ? CblasTrans : CblasNoTrans;
-    d_m = (flags & CV_HAL_GEMM_1_T) ? a_n : a_m;
-
-    if (flags & CV_HAL_GEMM_3_T)
-    {
-        c_m = d_n;
-        c_n = d_m;
-    }
-    else
-    {
-        c_m = d_m;
-        c_n = d_n;
-    }
-
-    if (flags & CV_HAL_GEMM_1_T)
-    {
-        transA = CblasTrans;
-        std::swap(a_n, a_m);
-    }
-    else
-    {
-        transA = CblasNoTrans;
-    }
-
-    if (src3 != dst && beta != 0.0 && src3_step != 0)
-    {
-        if (flags & CV_HAL_GEMM_3_T)
-            armpl_transpose(src3, ldsrc3, dst, lddst, c_m, c_n);
-        else
-            armpl_copy_matrix(src3, ldsrc3, dst, lddst, c_m, c_n);
-    }
-    else if (src3 == dst && (flags & CV_HAL_GEMM_3_T))
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-
-    else if (src3_step == 0 && beta != 0.0)
-        armpl_set_value(dst, lddst, elemtype(), d_m, d_n);
-
-    armpl_cblas_gemm(transA, transB, a_m, d_n, a_n, eAlpha, src1, ldsrc1, src2, ldsrc2, eBeta, dst, lddst);
-
-    return CV_HAL_ERROR_OK;
-}
-}
-
-static inline bool armpl_gemm_below_min_volume(int m, int n, int k)
-{
-    return (double)m * n * k < ARMPL_GEMM_MIN_WORK_VOLUME;
-}
-
-int armpl_hal_gemm32f(const float *src1, size_t src1_step, const float *src2, size_t src2_step, float alpha,
-                       const float *src3, size_t src3_step, float beta, float *dst, size_t dst_step,
-                       int m, int n, int k, int flags)
-{
-    if (armpl_gemm_below_min_volume(m, n, k))
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return armpl_gemm_impl<float, float>(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
-}
-
-int armpl_hal_gemm64f(const double *src1, size_t src1_step, const double *src2, size_t src2_step, double alpha,
-                       const double *src3, size_t src3_step, double beta, double *dst, size_t dst_step,
-                       int m, int n, int k, int flags)
-{
-    if (armpl_gemm_below_min_volume(m, n, k))
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return armpl_gemm_impl<double, double>(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
-}
-
-int armpl_hal_gemm32fc(const float *src1, size_t src1_step, const float *src2, size_t src2_step, float alpha,
-                        const float *src3, size_t src3_step, float beta, float *dst, size_t dst_step,
-                        int m, int n, int k, int flags)
-{
-    if (armpl_gemm_below_min_volume(m, n, k))
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    typedef std::complex<float> cplx;
-    return armpl_gemm_impl<cplx, float>(reinterpret_cast<const cplx*>(src1), src1_step, reinterpret_cast<const cplx*>(src2), src2_step, alpha,
-                                        reinterpret_cast<const cplx*>(src3), src3_step, beta, reinterpret_cast<cplx*>(dst), dst_step, m, n, k, flags);
-}
-
-int armpl_hal_gemm64fc(const double *src1, size_t src1_step, const double *src2, size_t src2_step, double alpha,
-                        const double *src3, size_t src3_step, double beta, double *dst, size_t dst_step,
-                        int m, int n, int k, int flags)
-{
-    if (armpl_gemm_below_min_volume(m, n, k))
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    typedef std::complex<double> cplx;
-    return armpl_gemm_impl<cplx, double>(reinterpret_cast<const cplx*>(src1), src1_step, reinterpret_cast<const cplx*>(src2), src2_step, alpha,
-                                         reinterpret_cast<const cplx*>(src3), src3_step, beta, reinterpret_cast<cplx*>(dst), dst_step, m, n, k, flags);
-}
-
-namespace {
-
-static inline armpl_int_t
-armpl_lapacke_gesdd(char jobz, int m, int n, float *a, int lda, float *s, float *u, int ldu, float *vt, int ldvt)
-{
-    return LAPACKE_sgesdd(LAPACK_COL_MAJOR, jobz, m, n, a, lda, s, u, ldu, vt, ldvt);
-}
-
-static inline armpl_int_t
-armpl_lapacke_gesdd(char jobz, int m, int n, double *a, int lda, double *s, double *u, int ldu, double *vt, int ldvt)
-{
-    return LAPACKE_dgesdd(LAPACK_COL_MAJOR, jobz, m, n, a, lda, s, u, ldu, vt, ldvt);
-}
-
-template <typename fptype> static inline void
-armpl_transpose_square_inplace(fptype *a, size_t lda, size_t n)
-{
-    for (size_t i = 0; i < n - 1; i++)
-        for (size_t j = i + 1; j < n; j++)
-            std::swap(a[j*lda + i], a[i*lda + j]);
-}
-
-template <typename fptype> static inline int
-armpl_svd(fptype *src, size_t src_step, fptype *w, fptype *u, size_t u_step, fptype *vt, size_t vt_step, int m, int n, int flags)
-{
-    int lda = (int)(src_step / sizeof(fptype));
-    int ldu = (int)(u_step / sizeof(fptype));
-    int ldv = (int)(vt_step / sizeof(fptype));
-    std::vector<fptype> ubuf;
-
-    char jobz = ' ';
-    if (flags & CV_HAL_SVD_NO_UV)
-    {
-        ldv = 1;
-        jobz = 'N';
-    }
-    else if ((flags & CV_HAL_SVD_SHORT_UV) && (flags & CV_HAL_SVD_MODIFY_A))
-        jobz = 'O';
-    else if ((flags & CV_HAL_SVD_SHORT_UV) && !(flags & CV_HAL_SVD_MODIFY_A))
-        jobz = 'S';
-    else if (flags & CV_HAL_SVD_FULL_UV)
-        jobz = 'A';
-
-    if ((flags & CV_HAL_SVD_MODIFY_A) && (flags & CV_HAL_SVD_FULL_UV))
-    {
-        ubuf.resize((size_t)m * m);
-        u = ubuf.data();
-        ldu = m;
-    }
-
-    armpl_int_t linfo = armpl_lapacke_gesdd(jobz, m, n, src, lda, w, u, ldu, vt, ldv);
-
-    if (linfo != 0)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-
-    if (!(flags & CV_HAL_SVD_NO_UV))
-        armpl_transpose_square_inplace(vt, ldv, n);
-
-    if ((flags & CV_HAL_SVD_MODIFY_A) && (flags & CV_HAL_SVD_FULL_UV))
-    {
-        for (int i = 0; i < m; i++)
-            std::copy(u + i*m, u + i*m + m, src + i*lda);
-    }
-
-    return CV_HAL_ERROR_OK;
-}
-
-static inline armpl_int_t armpl_lapacke_gesv(int m, int n, float *a, int lda, armpl_int_t *ipiv, float *b, int ldb){
-    return LAPACKE_sgesv(LAPACK_ROW_MAJOR, m, n, a, lda, ipiv, b, ldb);
-}
-static inline armpl_int_t armpl_lapacke_gesv(int m, int n, double *a, int lda, armpl_int_t *ipiv, double *b, int ldb){
-    return LAPACKE_dgesv(LAPACK_ROW_MAJOR, m, n, a, lda, ipiv, b, ldb);
-}
-static inline armpl_int_t armpl_lapacke_getrf(int m, float *a, int lda, armpl_int_t *ipiv){
-    return LAPACKE_sgetrf(LAPACK_ROW_MAJOR, m, m, a, lda, ipiv);
-}
-static inline armpl_int_t armpl_lapacke_getrf(int m, double *a, int lda, armpl_int_t *ipiv){
-    return LAPACKE_dgetrf(LAPACK_ROW_MAJOR, m, m, a, lda, ipiv);
-}
-
-template <typename fptype> static inline int
-armpl_lu(fptype *a, size_t a_step, int m, fptype *b, size_t b_step, int n, int *info)
-{
-    if(!info)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-
-    int lda = (int)(a_step / sizeof(fptype));
-    std::vector<armpl_int_t> ipiv(m);
-    armpl_int_t linfo;
-
-    if (b)
-    {
-        int ldb = (int)(b_step / sizeof(fptype));
-        linfo = armpl_lapacke_gesv(m, n, a, lda, ipiv.data(), b, ldb);
-    }
-    else
-    {
-        linfo = armpl_lapacke_getrf(m, a, lda, ipiv.data());
-    }
-
-    if (linfo < 0)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-
-    if (linfo == 0)
-    {
-        int sign = 0;
-        for (int i = 0; i < m; i++)
-            sign ^= (ipiv[i] != i + 1);
-        *info = sign ? -1 : 1;
-    }
-    else
-        *info = 0;
-
-    return CV_HAL_ERROR_OK;
-}
-
-}
-
-int armpl_hal_SVD32f(float *src, size_t src_step, float *w, float *u, size_t u_step, float *vt, size_t vt_step, int m, int n, int flags)
-{
-    if (m < ARMPL_SVD_SMALL_MATRIX_THRESH)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return armpl_svd(src, src_step, w, u, u_step, vt, vt_step, m, n, flags);
-}
-
-int armpl_hal_SVD64f(double *src, size_t src_step, double *w, double *u, size_t u_step, double *vt, size_t vt_step, int m, int n, int flags)
-{
-    if (m < ARMPL_SVD_SMALL_MATRIX_THRESH)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return armpl_svd(src, src_step, w, u, u_step, vt, vt_step, m, n, flags);
-}
-
-int armpl_hal_LU32f(float *a, size_t a_step, int m, float *b, size_t b_step, int n, int *info) {
-    if (m < ARMPL_LU_SMALL_MATRIX_THRESH)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return armpl_lu(a, a_step, m, b, b_step, n, info);
-}
-int armpl_hal_LU64f(double *a, size_t a_step, int m, double *b, size_t b_step, int n, int *info) {
-    if (m < ARMPL_LU_SMALL_MATRIX_THRESH)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return armpl_lu(a, a_step, m, b, b_step, n, info);
-}
-
+#include <cfloat>
+#include <vector>
+#include <algorithm>
 enum ArmPLDFTMode
 {
     ARMPL_DFT_C2C,
@@ -2950,6 +2641,144 @@ int armpl_hal_dctFree2D(cvhalDFT *context)
     }
 
     return CV_HAL_ERROR_OK;
+}
+
+static const int ARMPL_HAL_QR_MIN_SIZE = 50;
+
+template<typename T>
+static void armpl_reformat(const T* src, int src_ld, T* dst, int dst_ld, int rows, int cols)
+{
+    for (int i = 0; i < rows; i++)
+        for (int j = 0; j < cols; j++)
+            dst[j * dst_ld + i] = src[i * src_ld + j];
+}
+
+template<typename T>
+static void armpl_reformat_square_inplace(T* a, int ld, int n)
+{
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            std::swap(a[i * ld + j], a[j * ld + i]);
+}
+
+static void armpl_gels(char* t, int* m, int* n, int* k,
+                       float* A, int* lda, float* B, int* ldb,
+                       float* work, int* lwork, int* info)
+{
+    sgels_(t, m, n, k, A, lda, B, ldb, work, lwork, info);
+}
+
+static void armpl_gels(char* t, int* m, int* n, int* k,
+                       double* A, int* lda, double* B, int* ldb,
+                       double* work, int* lwork, int* info)
+{ dgels_(t, m, n, k, A, lda, B, ldb, work, lwork, info); }
+
+static void armpl_geqrf(int* m, int* n, float* A, int* lda, float* tau,
+                        float* work, int* lwork, int* info)
+{ sgeqrf_(m, n, A, lda, tau, work, lwork, info); }
+
+static void armpl_geqrf(int* m, int* n, double* A, int* lda, double* tau,
+                        double* work, int* lwork, int* info)
+{ dgeqrf_(m, n, A, lda, tau, work, lwork, info); }
+
+template<typename T>
+static int armpl_qr_impl(T* a, size_t a_step, int m, int n, int k,
+                         T* b, size_t b_step, T* dst, int* info, T eps)
+{
+    if (m < n)
+        return CV_HAL_ERROR_NOT_IMPLEMENTED;
+
+    int lda = (int)(a_step / sizeof(T));
+    int _m = m, _n = n, _k = k, lap_info = 0;
+
+    std::vector<T> tmpA_buf;
+    T* tmpA;
+    int ldtmpA;
+    if (m == n) {
+        armpl_reformat_square_inplace(a, lda, m);
+        tmpA   = a;
+        ldtmpA = lda;
+    } else {
+        tmpA_buf.resize((size_t)m * n);
+        tmpA   = tmpA_buf.data();
+        ldtmpA = m;
+        armpl_reformat(a, lda, tmpA, m, m, n);
+    }
+
+    if (b) {
+        char mode = 'N';
+        int ldb   = (int)(b_step / sizeof(T));
+        int lwork = -1;
+        T   work1 = T(0);
+
+        if (k == 1 && b_step == sizeof(T)) {
+            armpl_gels(&mode, &_m, &_n, &_k,
+                       tmpA, &ldtmpA, b, &_m, &work1, &lwork, &lap_info);
+            lwork = (int)work1;
+            std::vector<T> wbuf((size_t)lwork + 1);
+            lap_info = 0;
+            armpl_gels(&mode, &_m, &_n, &_k,
+                       tmpA, &ldtmpA, b, &_m, wbuf.data(), &lwork, &lap_info);
+        } else {
+            std::vector<T> tmpB_buf((size_t)m * k);
+            T* tmpB = tmpB_buf.data();
+            armpl_reformat(b, ldb, tmpB, m, m, k);
+            armpl_gels(&mode, &_m, &_n, &_k,
+                       tmpA, &ldtmpA, tmpB, &_m, &work1, &lwork, &lap_info);
+            lwork = (int)work1;
+            std::vector<T> wbuf((size_t)lwork + 1);
+            lap_info = 0;
+            armpl_gels(&mode, &_m, &_n, &_k,
+                       tmpA, &ldtmpA, tmpB, &_m, wbuf.data(), &lwork, &lap_info);
+            armpl_reformat(tmpB, m, b, ldb, k, m);
+        }
+    } else {
+        int lwork = -1;
+        T   work1 = T(0);
+        armpl_geqrf(&_m, &_n, tmpA, &ldtmpA, dst, &work1, &lwork, &lap_info);
+        lwork = (int)work1;
+        std::vector<T> wbuf((size_t)lwork + 1);
+        lap_info = 0;
+        armpl_geqrf(&_m, &_n, tmpA, &ldtmpA, dst, wbuf.data(), &lwork, &lap_info);
+    }
+
+    if (m == n)
+        armpl_reformat_square_inplace(a, lda, m);
+    else
+        armpl_reformat(tmpA, m, a, lda, n, m);
+
+    if (lap_info != 0) {
+        *info = 0;
+        return CV_HAL_ERROR_OK;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (std::fabs(a[i * lda + i]) < eps) {
+            *info = 0;
+            return CV_HAL_ERROR_OK;
+        }
+    }
+
+    *info = 1;
+    return CV_HAL_ERROR_OK;
+}
+
+int armpl_hal_QR32f(float* src1, size_t src1_step, int m, int n, int k,
+                    float* src2, size_t src2_step, float* dst, int* info)
+{
+    if (m < ARMPL_HAL_QR_MIN_SIZE)
+        return CV_HAL_ERROR_NOT_IMPLEMENTED;
+    return armpl_qr_impl(src1, src1_step, m, n, k,
+                         src2, src2_step, dst, info, FLT_EPSILON * 10.f);
+}
+
+int armpl_hal_QR64f(double* src1, size_t src1_step, int m, int n, int k,
+                    double* src2, size_t src2_step, double* dst, int* info)
+{
+    if (m < ARMPL_HAL_QR_MIN_SIZE)
+        return CV_HAL_ERROR_NOT_IMPLEMENTED;
+    return armpl_qr_impl(src1, src1_step, m, n, k,
+                         src2, src2_step, dst, info, DBL_EPSILON * 100.0);
 }
 
 #endif // HAVE_ARMPL
